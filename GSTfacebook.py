@@ -111,9 +111,7 @@ nEdgeFailRealizations = 20 # Number of realizations for each probability of
 # average across this randomness. Once a given failure of edges, we are
 # accounting for random data generation through several nTrain or nTest.
 
-# Every training excerpt has a WAN associated to it. We combine all these WANs
-# into a single graph to use as the supporting graph for all samples. This
-# combination happens under some extra options:
+# How to process the loaded Facebook graph
 keepIsolatedNodes = False # If True keeps isolated nodes
 forceConnected = True # If True removes nodes (from lowest to highest degree)
     # until the resulting graph is connected.
