@@ -773,7 +773,7 @@ def createGraph(graphType, N, graphOptions):
                 assert isConnected(W)
                 # And, if we have the extra argument, return all the other
                 # connected components
-                if logExtraComponents == 8:
+                if logExtraComponents == True:
                     extraComponents.append(eachAdjacency)
                     extraComponents.append(eachNodeList)
         # To end, update the node list, so that it is returned through argument
