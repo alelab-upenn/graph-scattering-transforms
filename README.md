@@ -1,5 +1,7 @@
 # Graph Scattering Transforms
-Code for experimentation on graph scattering transforms. If any part of this code is used, the following paper must be cited:
+Code for experimentation on graph scattering transforms. If any part of this code is used, the following paper must be cited: 
+
+F. Gama, J. Bruna, and A. Ribeiro, "<a href="http://arxiv.org/abs/1906.04784">Stability of graph scattering transforms</a>," arXiv:1906.04784v1 &#91;cs.LG&#93;, 11 June 2019.
 
 Any questions, comments or suggestions, please e-mail Fernando Gama at fgama@seas.upenn.edu. The specific random seeds used to get the results that appear in the paper can be obtained by request.
 
