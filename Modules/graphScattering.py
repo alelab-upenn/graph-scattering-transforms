@@ -201,7 +201,6 @@ def tightHannWavelet(V, E, J, R, eMax, doWarping = True):
     e = np.diag(E) # eigenvalues
     VH = V.conj().T # V hermitian
     N = V.shape[0] # Number of nodes
-    t = np.arange(1,J+1) * eMax / (J + 1 - R) # translations
     # Create wavelets
     H = np.empty([0, N, N])
     if doWarping:
@@ -209,16 +208,20 @@ def tightHannWavelet(V, E, J, R, eMax, doWarping = True):
         e[np.isnan(e)] = -infiniteNumber
         sumPsiSquared = np.zeros(N) # If there's warping, I have to add all the
             # kernels to build the scaling function (eq. 13)
+        eMax = np.log(eMax)
+    t = np.arange(1,J+1) * eMax / (J + 1 - R) # translations
     for j in range(0, J-1): # If there is no warping, then we should go all the
         # way to J, but if there's warping, we have to add the scaling function
         # at the beginning
         psi =  HannKernel(e - t[j], J, R, eMax)
         if doWarping:
-            sumPsiSquared = np.abs(psi) ** 2
+            sumPsiSquared += np.abs(psi) ** 2
         thisH = (V @ np.diag(psi) @ VH).reshape(1, N, N)
         H = np.concatenate((H, thisH), axis = 0)
     if doWarping:
-        psi = np.sqrt(R * 0.25 + R/2 * 0.25 - sumPsiSquared)
+        psi = R * 0.25 + R/2 * 0.25 - sumPsiSquared
+        psi[np.abs(psi) < zeroTolerance] = 0
+        psi = np.sqrt(psi)
         # Once we built the scaling function, we have to add it at the beginning
         # instead of at the end
         thisH = (V @ np.diag(psi) @ VH).reshape(1, N, N)
