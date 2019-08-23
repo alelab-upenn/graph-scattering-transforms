@@ -227,7 +227,9 @@ def tightHannWavelet(V, E, J, R, eMax, doWarping = True):
         thisH = (V @ np.diag(psi) @ VH).reshape(1, N, N)
         H = np.concatenate((thisH, H), axis = 0)
     else:
-        psi =  HannKernel(e - t[J], J, R, eMax)
+        psi =  HannKernel(e - t[J-1], J, R, eMax) # If there is no warping,
+            # then we can go all the way to use all the scales, so we pick the
+            # last value of t that we hadn't use before, and put it last.
         thisH = (V @ np.diag(psi) @ VH).reshape(1, N, N)
         H = np.concatenate((H, thisH), axis = 0)
     return H
