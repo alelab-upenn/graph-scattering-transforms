@@ -1,5 +1,5 @@
-# 2018/10/15~2019/05/23
-# Fernando Gama, fgama@seas.upenn.edu
+# 2018/10/15~2018/07/12
+# Fernando Gama, fgama@seas.upenn.edu.
 """
 miscTools Miscellaneous Tools module
 
@@ -91,7 +91,8 @@ def loadSeed(loadDir):
             np.random.RandomState().set_state(module['state'])
         elif thisModule == 'torch':
             torch.set_rng_state(module['state'])
-            torch.manual_seed(module['seed'])                
+            torch.manual_seed(module['seed'])
+                
 
 def writeVarValues(fileToWrite, varValues):
     """

@@ -1,4 +1,4 @@
-# 2018/12/04~2019/05/23
+# 2019/10/27
 # Fernando Gama, fgama@seas.upenn.edu
 """
 dataTools.py Data management module
@@ -6,7 +6,7 @@ dataTools.py Data management module
 Several tools to manage data
 
 FacebookEgo (class): loads the Facebook adjacency matrix of EgoNets
-SourceLocalization (class): creates the datasets for a source localization 
+SourceLocalization (class): creates the datasets for a source localization
     problem
 Authorship (class): loads and splits the dataset for the authorship attribution
     problem
@@ -16,7 +16,6 @@ import os
 import pickle
 import hdf5storage # This is required to import old Matlab(R) files.
 import urllib.request # To download from the internet
-
 import gzip # To handle gz files
 import shutil # Command line utilities
 
@@ -27,12 +26,96 @@ import Utils.graphTools as graph
 
 zeroTolerance = 1e-9 # Values below this number are considered zero.
 
+def normalizeData(x, ax):
+
+    # Normalize data along axis ax. The normalization is minus mean, divided
+    # by std
+
+    thisShape = x.shape # get the shape
+    assert ax < len(thisShape) # check that the axis that we want to normalize
+        # is there
+    dataType = type(x) # get data type so that we don't have to convert
+
+    if 'numpy' in repr(dataType):
+
+        # Compute the statistics
+        xMean = np.mean(x, axis = ax)
+        xDev = np.std(x, axis = ax)
+        # Add back the dimension we just took out
+        xMean = np.expand_dims(xMean, ax)
+        xDev = np.expand_dims(xDev, ax)
+
+    elif 'torch' in repr(dataType):
+
+        # Compute the statistics
+        xMean = torch.mean(x, dim = ax)
+        xDev = torch.std(x, dim = ax)
+        # Add back the dimension we just took out
+        xMean = xMean.unsqueeze(ax)
+        xDev = xDev.unsqueeze(ax)
+
+    # Subtract mean and divide by standard deviation
+    x = (x - xMean) / xDev
+
+    return x
+
+def changeDataType(x, dataType):
+
+    # So this is the thing: To change data type it depends on both, what dtype
+    # the variable already is, and what dtype we want to make it.
+    # Torch changes type by .type(), but numpy by .astype()
+    # If we have already a torch defined, and we apply a torch.tensor() to it,
+    # then there will be warnings because of gradient accounting.
+
+    # All of these facts make changing types considerably cumbersome. So we
+    # create a function that just changes type and handles all this issues
+    # inside.
+
+    # If we can't recognize the type, we just make everything numpy.
+
+    # Check if the variable has an argument called 'dtype' so that we can now
+    # what type of data type the variable is
+    if 'dtype' in dir(x):
+        varType = x.dtype
+
+    # So, let's start assuming we want to convert to numpy
+    if 'numpy' in repr(dataType):
+        # Then, the variable con be torch, in which case we move it to cpu, to
+        # numpy, and convert it to the right file.
+        if 'torch' in repr(varType):
+            x = x.cpu().numpy().astype(dataType)
+        # Or it could be numpy, in which case we just use .astype
+        elif 'numpy' in repr(type(x)):
+            x = x.astype(dataType)
+    # Now, we want to convert to torch
+    elif 'torch' in repr(dataType):
+        # If the variable is torch in itself
+        if 'torch' in repr(varType):
+            x = x.type(dataType)
+        # But, if it's numpy
+        elif 'numpy' in repr(type(x)):
+            x = torch.tensor(x, dtype = dataType)
+
+    # This only converts between numpy and torch. Any other thing is ignored
+    return x
+
 class _data:
     # Internal supraclass from which all data sets will inherit.
     # There are certain methods that all Data classes must have:
     #   getSamples(), to() and astype().
     # To avoid coding this methods over and over again, we create a class from
     # which the data can inherit this basic methods.
+
+    # All the inputs are always assumed to be graph signals that are written
+    #   nDataPoints (x nFeatures) x nNodes
+    # If we have one feature, we have the expandDims() that adds a x1 so that
+    # it can be readily processed by architectures/functions that always assume
+    # a 3-dimensional input.
+
+    # The output can be anything, so there's no point on doing an expandDims()
+    # there. It could be a label, or it could be another graph signal, or a
+    # one-hot vector. In any case, if there's a specific expand dims for the
+    # output, it has to be dealt with within that specific class.
     def __init__(self):
         # Minimal set of attributes that all data classes should have
         self.dataType = None
@@ -43,14 +126,14 @@ class _data:
         self.samples = {}
         self.samples['train'] = {}
         self.samples['train']['signals'] = None
-        self.samples['train']['labels'] = None
+        self.samples['train']['targets'] = None
         self.samples['valid'] = {}
         self.samples['valid']['signals'] = None
-        self.samples['valid']['labels'] = None
+        self.samples['valid']['targets'] = None
         self.samples['test'] = {}
         self.samples['test']['signals'] = None
-        self.samples['test']['labels'] = None
-        
+        self.samples['test']['targets'] = None
+
     def getSamples(self, samplesType, *args):
         # type: train, valid, test
         # args: 0 args, give back all
@@ -63,7 +146,7 @@ class _data:
         assert len(args) <= 1
         # If there are no arguments, just return all the desired samples
         x = self.samples[samplesType]['signals']
-        y = self.samples[samplesType]['labels']
+        y = self.samples[samplesType]['targets']
         # If there's an argument, we have to check whether it is an int or a
         # list
         if len(args) == 1:
@@ -76,51 +159,102 @@ class _data:
                 # Randomly choose args[0] indices
                 selectedIndices = np.random.choice(nSamples, size = args[0],
                                                    replace = False)
-                # The reshape is to avoid squeezing if only one sample is
-                # requested
-                x = x[selectedIndices,:].reshape([args[0], x.shape[1]])
+                # Select the corresponding samples
+                xSelected = x[selectedIndices]
                 y = y[selectedIndices]
             else:
                 # The fact that we put else here instead of elif type()==list
                 # allows for np.array to be used as indices as well. In general,
                 # any variable with the ability to index.
-                x = x[args[0], :]
-                # If only one element is selected, avoid squeezing. Given that
-                # the element can be a list (which has property len) or an
-                # np.array (which doesn't have len, but shape), then we can
-                # only avoid squeezing if we check that it has been sequeezed
-                # (or not)
-                if len(x.shape) == 1:
-                    x = x.reshape([1, x.shape[0]])
+                xSelected = x[args[0]]
                 # And assign the labels
                 y = y[args[0]]
 
+            # If we only selected a single element, then the nDataPoints dim
+            # has been left out. So if we have less dimensions, we have to
+            # put it back
+            if len(xSelected.shape) < len(x.shape):
+                if 'torch' in self.dataType:
+                    x = xSelected.unsqueeze(0)
+                else:
+                    x = np.expand_dims(xSelected, axis = 0)
+            else:
+                x = xSelected
+
         return x, y
 
+    def expandDims(self):
+
+        # For each data set partition
+        for key in self.samples.keys():
+            # If there's something in them
+            if self.samples[key]['signals'] is not None:
+                # And if it has only two dimensions
+                #   (shape: nDataPoints x nNodes)
+                if len(self.samples[key]['signals'].shape) == 2:
+                    # Then add a third dimension in between so that it ends
+                    # up with shape
+                    #   nDataPoints x 1 x nNodes
+                    # and it respects the 3-dimensional format that is taken
+                    # by many of the processing functions
+                    if 'torch' in repr(self.dataType):
+                        self.samples[key]['signals'] = \
+                                       self.samples[key]['signals'].unsqueeze(1)
+                    else:
+                        self.samples[key]['signals'] = np.expand_dims(
+                                                   self.samples[key]['signals'],
+                                                   axis = 1)
+
     def astype(self, dataType):
-        # This changes the type for the minimal attributes (samples). This 
+        # This changes the type for the minimal attributes (samples). This
         # methods should still be initialized within the data classes, if more
         # attributes are used.
-        if repr(dataType).find('torch') == -1:
-            for key in self.samples.keys():
-                for secondKey in self.samples[key].keys():
-                    self.samples[key][secondKey] \
-                                       = dataType(self.samples[key][secondKey])
-        else:
-            for key in self.samples.keys():
-                for secondKey in self.samples[key].keys():
-                    self.samples[key][secondKey] \
-                    = torch.tensor(self.samples[key][secondKey]).type(dataType)
 
+        # The labels could be integers as created from the dataset, so if they
+        # are, we need to be sure they are integers also after conversion.
+        # To do this we need to match the desired dataType to its int
+        # counterpart. Typical examples are:
+        #   numpy.float64 -> numpy.int64
+        #   numpy.float32 -> numpy.int32
+        #   torch.float64 -> torch.int64
+        #   torch.float32 -> torch.int32
+
+        targetType = str(self.samples['train']['targets'].dtype)
+        if 'int' in targetType:
+            if 'numpy' in repr(dataType):
+                if '64' in targetType:
+                    targetType = np.int64
+                elif '32' in targetType:
+                    targetType = np.int32
+            elif 'torch' in repr(dataType):
+                if '64' in targetType:
+                    targetType = torch.int64
+                elif '32' in targetType:
+                    targetType = torch.int32
+        else: # If there is no int, just stick with the given dataType
+            targetType = dataType
+
+        # Now that we have selected the dataType, and the corresponding
+        # labelType, we can proceed to convert the data into the corresponding
+        # type
+        for key in self.samples.keys():
+            self.samples[key]['signals'] = changeDataType(
+                                                   self.samples[key]['signals'],
+                                                   dataType)
+            self.samples[key]['targets'] = changeDataType(
+                                                   self.samples[key]['targets'],
+                                                   targetType)
+
+        # Update attribute
         if dataType is not self.dataType:
             self.dataType = dataType
 
     def to(self, device):
-        # This changes the type for the minimal attributes (samples). This 
+        # This changes the type for the minimal attributes (samples). This
         # methods should still be initialized within the data classes, if more
         # attributes are used.
         # This can only be done if they are torch tensors
-        if repr(self.dataType).find('torch') >= 0:
+        if 'torch' in repr(self.dataType):
             for key in self.samples.keys():
                 for secondKey in self.samples[key].keys():
                     self.samples[key][secondKey] \
@@ -135,11 +269,11 @@ class _dataForClassification(_data):
     # for classification. This renders the .evaluate() method the same in all
     # cases (how many examples are correctly labels) so justifies the use of
     # another internal class.
-    
+
     def __init__(self):
-        
+
         super().__init__()
-    
+
 
     def evaluate(self, yHat, y, tol = 1e-9):
         """
@@ -148,7 +282,7 @@ class _dataForClassification(_data):
         N = len(y)
         if 'torch' in repr(self.dataType):
             #   We compute the target label (hardmax)
-            yHat = torch.argmax(yHat, dim = 1).type(self.dataType)
+            yHat = torch.argmax(yHat, dim = 1)
             #   And compute the error
             totalErrors = torch.sum(torch.abs(yHat - y) > tol)
             accuracy = 1 - totalErrors.type(self.dataType)/N
@@ -156,51 +290,48 @@ class _dataForClassification(_data):
             yHat = np.array(yHat)
             y = np.array(y)
             #   We compute the target label (hardmax)
-            yHat = np.argmax(yHat, axis = 1).astype(y.dtype)
+            yHat = np.argmax(yHat, axis = 1)
             #   And compute the error
             totalErrors = np.sum(np.abs(yHat - y) > tol)
             accuracy = 1 - totalErrors.astype(self.dataType)/N
         #   And from that, compute the accuracy
         return accuracy
-     
+
 class FacebookEgo:
     """
     FacebookEgo: Loads the adjacency matrix of the Facebook Egonets available
         in https://snap.stanford.edu/data/ego-Facebook.html by
         J. McAuley and J. Leskovec. Learning to Discover Social Circles in Ego
         Networks. NIPS, 2012.
-
     Initialization:
-
     Input:
-        dataDir (string): path for the directory in where to look for the data 
+        dataDir (string): path for the directory in where to look for the data
             (if the data is not found, it will be downloaded to this directory)
         use234 (bool): if True, load a smaller subnetwork of 234 users with two
             communities (one big, and one small)
-        
+
     Methods:
-        
+
     .loadData(filename, use234): load the data in self.dataDir/filename, if it
         does not exist, then download it and save it as filename in self.dataDir
         If use234 is True, load the 234-user subnetwork as well.
-        
+
     adjacencyMatrix = .getAdjacencyMatrix([use234]): return the nNodes x nNodes
         np.array with the adjacency matrix. If use234 is True, then return the
         smaller nNodes = 234 user subnetwork (default: use234 = False).
-
     """
-    
+
     def __init__(self, dataDir, use234 = False):
-        
+
         # Dataset directory
         self.dataDir = dataDir
         # Empty attributes
         self.adjacencyMatrix = None
         self.adjacencyMatrix234 = None
-        
+
         # Load data
         self.loadData('facebookEgo.pkl', use234)
-        
+
     def loadData(self, filename, use234):
         # Check if the dataDir exists, and if not, create it
         if not os.path.exists(self.dataDir):
@@ -221,7 +352,7 @@ class FacebookEgo:
                 # And save the corresponding variable
                 self.adjacencyMatrix = datasetDict['adjacencyMatrix']
         else: # If it doesn't exist, load it
-            # There could be three options here: that we have the raw data 
+            # There could be three options here: that we have the raw data
             # already there, that we have the zip file and need to unzip it,
             # or that we do not have nothing and we need to download it.
             existsRawData = \
@@ -242,7 +373,6 @@ class FacebookEgo:
                 with gzip.open(zipFile, 'rb') as f_in:
                     with open(txtFile, 'wb') as f_out:
                         shutil.copyfileobj(f_in, f_out)
-
             # Now that we have the data, we can get their filenames
             rawDataFilename = os.path.join(self.dataDir,'facebook_combined.txt')
             assert os.path.isfile(rawDataFilename)
@@ -262,7 +392,7 @@ class FacebookEgo:
                     node_i = int(dataLineSplit[0])
                     node_j = int(dataLineSplit[1])
                     node_max = max(node_i, node_j) # Get the largest node
-                    # Now we have to add this information to the adjacency 
+                    # Now we have to add this information to the adjacency
                     # matrix.
                     #   We need to check whether we need to add more elements
                     if node_max+1 > max(adjacencyMatrix.shape):
@@ -290,9 +420,9 @@ class FacebookEgo:
                         {'adjacencyMatrix': self.adjacencyMatrix},
                         datasetFile
                         )
-    
+
     def getAdjacencyMatrix(self, use234 = False):
-        
+
         return self.adjacencyMatrix234 if use234 else self.adjacencyMatrix
 
 class SourceLocalization(_dataForClassification):
@@ -332,6 +462,12 @@ class SourceLocalization(_dataForClassification):
             >> Obs.: The 0th dimension matches the corresponding signal to its
                 respective label
 
+    .expandDims(): Adds the feature dimension to the graph signals (i.e. for
+        graph signals of shape nSamples x nNodes, turns them into shape
+        nSamples x 1 x nNodes, so that they can be handled by general graph
+        signal processing techniques that take into account a feature dimension
+        by default)
+
     .astype(type): change the type of the data matrix arrays.
         Input:
             type (dtype): target type of the variables (e.g. torch.float64,
@@ -344,10 +480,12 @@ class SourceLocalization(_dataForClassification):
 
     accuracy = .evaluate(yHat, y, tol = 1e-9)
         Input:
-            yHat (dtype.array): estimated labels (1-D binary vector)
-            y (dtype.array): correct labels (1-D binary vector)
-            >> Obs.: both arrays are of the same length
-            tol (float): numerical tolerance to consider two numbers to be equal
+            yHat (dtype.array): unnormalized probability of each label (shape:
+                nDataPoints x nClasses)
+            y (dtype.array): correct labels (1-D binary vector, shape:
+                nDataPoints)
+            tol (float, default = 1e-9): numerical tolerance to consider two
+                numbers to be equal
         Output:
             accuracy (float): proportion of correct labels
 
@@ -399,15 +537,15 @@ class SourceLocalization(_dataForClassification):
         labels = [nodesToLabels[x] for x in sampledSources] # nTotal
         # Split and save them
         self.samples['train']['signals'] = signals[0:nTrain, :]
-        self.samples['train']['labels'] = labels[0:nTrain]
+        self.samples['train']['targets'] = np.array(labels[0:nTrain])
         self.samples['valid']['signals'] = signals[nTrain:nTrain+nValid, :]
-        self.samples['valid']['labels'] = labels[nTrain:nTrain+nValid]
+        self.samples['valid']['targets'] =np.array(labels[nTrain:nTrain+nValid])
         self.samples['test']['signals'] = signals[nTrain+nValid:nTotal, :]
-        self.samples['test']['labels'] = labels[nTrain+nValid:nTotal]
+        self.samples['test']['targets'] =np.array(labels[nTrain+nValid:nTotal])
         # Change data to specified type and device
         self.astype(self.dataType)
         self.to(self.device)
-    
+
 class Authorship(_dataForClassification):
     """
     Authorship: Loads the dataset of 19th century writers for the authorship
@@ -432,12 +570,12 @@ class Authorship(_dataForClassification):
         device (device): where to store the data (e.g., 'cpu', 'cuda:0', etc.)
 
     Methods:
-        
-    .loadData(dataPath): load the data found in dataPath and store it in 
+
+    .loadData(dataPath): load the data found in dataPath and store it in
         attributes .authorData and .functionWords
-        
+
     authorData = .getAuthorData(samplesType, selectData, [, optionalArguments])
-    
+
         Input:
             samplesType (string): 'train', 'valid', 'test' or 'all' to determine
                 from which dataset to get the raw author data from
@@ -448,21 +586,21 @@ class Authorship(_dataForClassification):
                 0 optional arguments: get all the samples from the specified set
                 1 optional argument (int): number of samples to get (at random)
                 1 optional argument (list): specific indices of samples to get
-        
+
         Output:
             Either the WANs or the word frequency count of all the excerpts of
             the selected author
-            
+
     .createGraph(): creates a graph from the WANs of the excerpt written by the
         selected author available in the training set. The fusion of this WANs
-        is done in accordance with the input options following 
+        is done in accordance with the input options following
         graphTools.createGraph().
         The resulting adjacency matrix is stored.
-        
+
     .getGraph(): fetches the stored adjacency matrix and returns it
-    
+
     .getFunctionWords(): fetches the list of functional words. Returns a tuple
-        where the first element correspond to all the functional words in use, 
+        where the first element correspond to all the functional words in use,
         and the second element consists of all the functional words available.
         Obs.: When we created the graph, some of the functional words might have
         been dropped in order to make it connected, for example.
@@ -480,6 +618,12 @@ class Authorship(_dataForClassification):
             labels (dtype.array): numberSamples
             >> Obs.: The 0th dimension matches the corresponding signal to its
                 respective label
+
+    .expandDims(): Adds the feature dimension to the graph signals (i.e. for
+        graph signals of shape nSamples x nNodes, turns them into shape
+        nSamples x 1 x nNodes, so that they can be handled by general graph
+        signal processing techniques that take into account a feature dimension
+        by default)
 
     .astype(type): change the type of the data matrix arrays.
         Input:
@@ -501,7 +645,7 @@ class Authorship(_dataForClassification):
             accuracy (float): proportion of correct labels
 
     """
-    
+
     def __init__(self, authorName, ratioTrain, ratioValid, dataPath,
                  graphNormalizationType, keepIsolatedNodes,
                  forceUndirected, forceConnected,
@@ -544,7 +688,7 @@ class Authorship(_dataForClassification):
         self.nTrain = round(2 * nTrainAuthor)
         self.nValid = round(2 * nValidAuthor)
         self.nTest = round(2 * nTestAuthor)
-        
+
         # Now, let's get the corresponding signals for the author
         xAuthor = thisAuthorData['wordFreq']
         # Get a random permutation of these works, and split them accordingly
@@ -600,7 +744,7 @@ class Authorship(_dataForClassification):
         xRestTrain = xRest[randPerm[0:nTrainRest], :]
         xRestValid = xRest[randPerm[nTrainRest:nTrainRest + nValidRest], :]
         xRestTest = xRest[randPerm[nTrainRest+nValidRest:nExcerpts], :]
-        # Now construct the signals and labels. Signals is just the 
+        # Now construct the signals and labels. Signals is just the
         # concatenation of each of these excerpts. Labels is just a bunch of
         # 1s followed by a bunch of 0s
         # Obs.: The fact that the dataset is ordered now, it doesn't matter,
@@ -616,19 +760,19 @@ class Authorship(_dataForClassification):
                                      np.zeros(nTestRest)), axis = 0)
         # And assign them to the required attribute samples
         self.samples['train']['signals'] = xTrain
-        self.samples['train']['labels'] = labelsTrain
+        self.samples['train']['targets'] = labelsTrain.astype(np.int)
         self.samples['valid']['signals'] = xValid
-        self.samples['valid']['labels'] = labelsValid
+        self.samples['valid']['targets'] = labelsValid.astype(np.int)
         self.samples['test']['signals'] = xTest
-        self.samples['test']['labels'] = labelsTest
+        self.samples['test']['targets'] = labelsTest.astype(np.int)
         # Create graph
         self.createGraph()
         # Change data to specified type and device
         self.astype(self.dataType)
         self.to(self.device)
-        
+
     def loadData(self, dataPath):
-        # TODO: Analyze if it's worth it to create a .pkl and load that 
+        # TODO: Analyze if it's worth it to create a .pkl and load that
         # directly once the data has been appropriately parsed. It's just
         # that loading with hdf5storage takes a couple of second that
         # could be saved if the .pkl file is faster.
@@ -638,7 +782,7 @@ class Authorship(_dataForClassification):
         #   'all_freqs': contains the word frequency count for each excerpt
         #   'all_wans': contains the WANS for each excerpt
         #   'function_words': a list of the functional words
-        # The issue is that hdf5storage, while necessary to load old 
+        # The issue is that hdf5storage, while necessary to load old
         # Matlab(R) files, gives the data in a weird format, that we need
         # to adapt and convert.
         # The data will be structured as follows. We will have an
@@ -651,23 +795,23 @@ class Authorship(_dataForClassification):
         for it in range(len(rawData['all_authors'])):
             thisAuthor = str(rawData['all_authors'][it][0][0][0])
             # Each element in rawData['all_authors'] is nested in a couple
-            # of lists, so that's why we need the three indices [0][0][0] 
+            # of lists, so that's why we need the three indices [0][0][0]
             # to reach the string with the actual author name.
             # Get the word frequency
             thisWordFreq = rawData['all_freqs'][0][it] # 1 x nWords x nData
             # Again, the [0] is due to the structure of the data
             # Let us get rid of that extra 1, and then transpose this to be
-            # stored as nData x nWords (since nWords is the dimension of 
+            # stored as nData x nWords (since nWords is the dimension of
             # the number of nodes the network will have; CS notation)
             thisWordFreq = thisWordFreq.squeeze(0).T # nData x nWords
             # Finally, get the WANs
             thisWAN = rawData['all_wans'][0][it] # nWords x nWords x nData
             thisWAN = thisWAN.transpose(2, 0, 1) # nData x nWords x nWords
-            # Obs.: thisWAN is likely not symmetric, so the way this is 
+            # Obs.: thisWAN is likely not symmetric, so the way this is
             # transposed matters. In this case, since thisWAN was intended
-            # to be a tensor in matlab (where the last index is the 
+            # to be a tensor in matlab (where the last index is the
             # collection of matrices), we just throw that last dimension to
-            # the front (since numpy consider the first index as the 
+            # the front (since numpy consider the first index as the
             # collection index).
             # Now we can create the dictionary and save the corresopnding
             # data.
@@ -682,7 +826,7 @@ class Authorship(_dataForClassification):
         self.authorData = authorData
         self.allFunctionWords = functionWords
         self.functionWords = functionWords.copy()
-        
+
     def getAuthorData(self, samplesType, dataType, *args):
         # type: train, valid, test
         # args: 0 args, give back all
@@ -733,9 +877,9 @@ class Authorship(_dataForClassification):
                     x = xNew.reshape(newShape)
 
         return x
-    
+
     def createGraph(self):
-        
+
         # Save list of nodes to keep to later update the datasets with the
         # appropriate words
         nodesToKeep = []
@@ -757,59 +901,55 @@ class Authorship(_dataForClassification):
         # Store adjacency matrix
         self.adjacencyMatrix = W.astype(np.float64)
         # Update data
-        if self.samples['train']['signals'] is not None:
-            self.samples['train']['signals'] = \
-                                self.samples['train']['signals'][:, nodesToKeep]
-        if self.samples['valid']['signals'] is not None:
-            self.samples['valid']['signals'] = \
-                                self.samples['valid']['signals'][:, nodesToKeep]
-        if self.samples['test']['signals'] is not None:
-            self.samples['test']['signals'] = \
-                                self.samples['test']['signals'][:, nodesToKeep]
+        #   For each dataset split
+        for key in self.samples.keys():
+            #   Check the signals have been loaded
+            if self.samples[key]['signals'] is not None:
+                #   And check which is the dimension of the nodes (i.e. whether
+                #   it was expanded or not, since we always need to keep the
+                #   entries of the last dimension)
+                if len(self.samples[key]['signals'].shape) == 2:
+                    self.samples[key]['signals'] = \
+                                   self.samples[key]['signals'][: , nodesToKeep]
+                elif len(self.samples[key]['signals'].shape) == 2:
+                    self.samples[key]['signals'] = \
+                                   self.samples[key]['signals'][:,:,nodesToKeep]
+
         if self.allFunctionWords is not None:
             self.functionWords = [self.allFunctionWords[w] for w in nodesToKeep]
-        
+
     def getGraph(self):
-        
+
         return self.adjacencyMatrix
-    
+
     def getFunctionWords(self):
-        
+
         return self.functionWords, self.allFunctionWords
-    
+
     def astype(self, dataType):
         # This changes the type for the selected author as well as the samples
-        # First, the selected author info
-        if repr(dataType).find('torch') == -1:
-            for key in self.selectedAuthor.keys():
-                for secondKey in self.selectedAuthor[key].keys():
-                    self.selectedAuthor[key][secondKey] \
-                                 = dataType(self.selectedAuthor[key][secondKey])
-            self.adjacencyMatrix = dataType(self.adjacencyMatrix)
-        else:
-            for key in self.selectedAuthor.keys():
-                for secondKey in self.selectedAuthor[key].keys():
-                    self.selectedAuthor[key][secondKey] \
-                            = torch.tensor(self.selectedAuthor[key][secondKey])\
-                                    .type(dataType)
-            self.adjacencyMatrix = torch.tensor(self.adjacencyMatrix)\
-                                        .type(dataType)
+        for key in self.selectedAuthor.keys():
+            for secondKey in self.selectedAuthor[key].keys():
+                self.selectedAuthor[key][secondKey] = changeDataType(
+                                            self.selectedAuthor[key][secondKey],
+                                            dataType)
+        self.adjacencyMatrix = changeDataType(self.adjacencyMatrix, dataType)
 
-        # And now, initialize to change the samples as well (and also save the 
+        # And now, initialize to change the samples as well (and also save the
         # data type)
         super().astype(dataType)
-        
-    
+
+
     def to(self, device):
         # If the dataType is 'torch'
-        if repr(self.dataType).find('torch') >= 0:
+        if 'torch' in repr(self.dataType):
             # Change the selected author ('test', 'train', 'valid', 'all';
             # 'WANs', 'wordFreq')
             for key in self.selectedAuthor.keys():
                 for secondKey in self.selectedAuthor[key].keys():
                     self.selectedAuthor[key][secondKey] \
                                 = self.selectedAuthor[key][secondKey].to(device)
-            self.adjacencyMatrix.to(device)                 
+            self.adjacencyMatrix.to(device)
             # And call the inherit method to initialize samples (and save to
             # device)
             super().to(device)

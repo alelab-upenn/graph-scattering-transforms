@@ -1,20 +1,22 @@
-# 2019/05/22~23
+# 2019/10/27
 # Fernando Gama, fgama@seas.upenn.edu
 
 # Graph scattering transform.
 
 # Compute the classification accuracy of the different representations on the
 # source localization problem over the Facebook Ego graph
-#   J. McAuley and J. Leskovec. Learning to Discover Social Circles in Ego
-#   Networks. NIPS, 2012.
+#   J. McAuley and J. Leskovec, "Learning to discover social circles in Ego
+#    networks," in 26th Conf. Neural Inform. Process. Syst. Stateline, TX:
+#   Neural Inform. Process. Foundation, 3-8 Dec. 2012.
 # Representations considered:
 #   GFT: unstable graph-dependent representation
-#   Diffusion scattering: comparison with other works
+#   Geometric scattering: Gao et al scattering
 #   Monic cubic polynomial wavelet: Hammond et al wavelets
 #   Tight Hann wavelets: Shuman et al wavelets
+#   GIN: Xu et al, trainable GNN
 # The idea is just to show that the graph scattering transform still achieves
 # reasonable classification accuracy when compared to other methods like the
-# GFT or the data itself.
+# GFT or the GIN.
 
 #%%##################################################################
 #                                                                   #
@@ -34,10 +36,18 @@ import datetime
 
 from sklearn.svm import LinearSVC
 
+import torch; torch.set_default_dtype(torch.float64)
+import torch.nn as nn
+import torch.optim as optim
+
 #\\\ Own libraries:
 import Modules.graphScattering as GST
 import Utils.graphTools as graphTools
 import Utils.dataTools
+
+import Utils.graphML as gml
+import Modules.architectures as archit
+import Modules.model as model
 
 #\\\ Own separate functions:
 from Utils.miscTools import writeVarValues
@@ -89,6 +99,8 @@ saveSeed(randomStates, saveDir)
 # DATA #
 ########
 
+useGPU = True # If true, and GPU is available, use it.
+
 nClasses = 2 # There are two communities
 # In the simulation, to make graph changes that are more "realistic" we consider
 # that some edges will fail with a given probability (i.e. unfriending).
@@ -106,7 +118,7 @@ nTest = 200 # Number of test samples
 tMax = 20 # When creating the samples for the source localization, this is the
     # maximum number of diffusion times that are simulated
 
-nEdgeFailRealizations = 20 # Number of realizations for each probability of 
+nEdgeFailRealizations = 10 # Number of realizations for each probability of
 # edge failure. There is randomness in how the edges fail, so we want to
 # average across this randomness. Once a given failure of edges, we are
 # accounting for random data generation through several nTrain or nTest.
@@ -130,16 +142,20 @@ writeVarValues(varsFile,
                 'nEdgeFailRealizations': nEdgeFailRealizations,
                 'keepIsolatedNodes': keepIsolatedNodes,
                 'forceConnected': forceConnected,
-                'use234': use234})
-    
+                'use234': use234,
+                'useGPU': useGPU})
+
 #################
 # ARCHITECTURES #
 #################
 
 # Select which wavelets to use
-doDiffusion = True # F. Gama, A. Ribeiro, and J. Bruna, "Diffusion scattering
-    # transforms on graphs,” in Int. Conf. Learning Representations 2019.
-    # New Orleans, LA: Assoc. Comput. Linguistics, 6-9 May 2019.
+doDiffusion = False # F. Gama, A. Ribeiro, and J. Bruna, "Diffusion scattering
+    # transforms on graphs," in 7th Int. Conf. Learning Representations. New
+    # Orleans, LA: Assoc. Comput. Linguistics, 6-9 May 2019, pp. 1–12.
+doGeometric = True # F. Gao, G. Wolf, and M. Hirn, "Geometric scattering for
+    # graph data analysis," in 36th Int. Conf. Mach. Learning, Long Beach, CA,
+    # 15-9 June 2019, pp. 1–10.
 doMonicCubic = True # Eq. (65) in D. K. Hammond, P. Vandergheynst, and
     # R. Gribonval, "Wavelets on graphs via spectral graph theory," Appl.
     # Comput. Harmonic Anal., vol. 30, no. 2, pp. 129–150, March 2011.
@@ -156,12 +172,19 @@ normalizeGSOforGFT = True # The GSO for the GFT is the Laplacian (if possible),
     # options.
 doData = False # Do classification straight into the data, without any other
     # representation
+doTrainableGNN = True # Use a GNN (a Selection GNN: ChebNet, GIN, etc.) and
+    # train it over the same training set that we train the classifier on.
+    # Performance will depend on the number of epochs.
 
 numScales = 6 # Number of scales J (the first element might be the "low-pass"
     # wavelet) so we would get J-1 "wavelet scales" and 1 (the first one, j=0)
     # "low-pass" wavelet
 numLayers = 3 # Number of layers L (0, ..., L-1) with l=0 being just Ux
-nFeatures = np.sum(numScales ** np.arange(0, numLayers, dtype=np.float)) 
+numMoments = 4 # For the geometric scattering transform, this is the number of
+    # moments to compute in the summarizing operation U
+
+# Compute number of features to use in all other methods as well:
+nFeatures = np.sum(numScales ** np.arange(0, numLayers, dtype=np.float))
 nFeatures = np.int(nFeatures) # Number of features
 fullGFT = False # if True use all the GFT coefficients
 nGFTcoeff = nFeatures # number of GFT coefficients to use (if not fullGFT)
@@ -171,6 +194,7 @@ GFTfilterType = 'band' # 'low', 'band' or 'high' pass (lowest frequencies,
 #\\\ Save values:
 writeVarValues(varsFile, {'numScales': numScales,
                           'numLayers': numLayers,
+                          'numMoments': numMoments,
                           'nFeatures': nFeatures,
                           'fullGFT': fullGFT,
                           'nGFTcoeff': nGFTcoeff,
@@ -182,6 +206,9 @@ modelList = [] # List to store the list of models chosen
 if doDiffusion:
     diffusionName = 'Diffusion'
     modelList.append(diffusionName)
+if doGeometric:
+    geometricName = 'Geometric'
+    modelList.append(geometricName)
 if doMonicCubic:
     monicCubicName = 'Monic Cubic'
     modelList.append(monicCubicName)
@@ -192,6 +219,77 @@ if doGFT:
     GFTname = 'GFT'
 if doData:
     DataName = 'Data'
+if doTrainableGNN:
+
+    # Training options
+    #   ADAM optimizer parameters
+    learningRate = 0.001
+    beta1 = 0.9
+    beta2 = 0.999
+    #   Loss function
+    lossFunction = nn.CrossEntropyLoss
+    #   Training procedure
+    #   (We will try two different number of epochs)
+    nEpochs = 40
+    batchSize = 20
+    validationInterval = 5 # How many training steps to do in between validation
+
+    writeVarValues(varsFile,
+                   {'learningRate': learningRate,
+                    'beta1': beta1,
+                    'beta2': beta2,
+                    'lossFunction': lossFunction,
+                    'nEpochs': nEpochs,
+                    'batchSize': batchSize,
+                    'validationInterval': validationInterval})
+
+    # Hyperparamenters for the GIN. The GIN is a particular case of the
+    # Selection GNN, so we will use the Selection GNN method to create the GIN
+    hParamsGIN = {}
+
+    # In particular, we consider a single-layer GIN, this means, there is only
+    # one time where we have exchange with neighbors. No pooling is considered.
+
+    # For details in the meaning of F, K and alpha, please refer to
+    # Modules.architectures
+
+    # Graph convolutional layers
+    hParamsGIN['F'] = [1, nFeatures]
+    hParamsGIN['K'] = [2]
+    hParamsGIN['bias'] = True
+    # Nonlinearity
+    hParamsGIN['sigma'] = nn.ReLU
+    # Pooling (no pooling)
+    hParamsGIN['rho'] = gml.NoPool
+    hParamsGIN['alpha'] = [1]
+    # Readout layer
+    hParamsGIN['dimLayersMLP'] = [nClasses]
+
+    hParamsGIN['name'] = 'GIN'
+    GINname = hParamsGIN['name']
+
+    # Important note!
+    # The GIN first computes an MLP over the individual nodes' features, and
+    # then exchanges information with the one-hop neighbors.
+
+    # To adjust the depth of the MLP, add the desired number of features (in the
+    # 'F' key of the dictionary, after the value 1 -which corresponds to the
+    # number of input features-), each one associated with a value of K = 1
+    # (recall that the value l in the list 'F' corresponds to the value l-1 in
+    # the list 'K').
+
+    # The value of K for the neighboring exchanges has to be set to K=2 for this
+    # to be a GIN. We can, certainly, choose any other value if we want to
+    # collect information from farther away neighborhoods.
+
+    # If we want more GIN layers, then just add as many 1 in the K list for the
+    # depth of the MLP, and finally a 2 when the "aggregation step" is to be
+    # carried out.
+
+    # For more details on the general framework of GIN, please refer to
+    # F. Gama, A. G. Marques, G. Leus, and A. Ribeiro, "Convolutional neural
+    # network architectures for signals supported on graphs," IEEE Trans. Signal
+    # Process., vol. 67, no. 4, pp. 1034–1049, Feb. 2019.
 
 ###########
 # LOGGING #
@@ -223,6 +321,25 @@ writeVarValues(varsFile,
 #                                                                   #
 #####################################################################
 
+#\\\ Determine processing unit:
+if useGPU and torch.cuda.is_available():
+    device = 'cuda:0'
+    torch.cuda.empty_cache()
+else:
+    device = 'cpu'
+# Notify:
+if doPrint:
+    print("Device selected: %s" % device)
+
+# Bind together the training options
+
+trainingOptions = {}
+
+if doSaveVars:
+    trainingOptions['saveDir'] = saveDir
+trainingOptions['validationInterval'] = validationInterval
+trainingOptions['printInterval'] = 0
+
 #\\\ Save variables during evaluation.
 
 accGST = {} # Classification accuracy
@@ -240,7 +357,10 @@ if doGFT:
 # Same for classification straight using data
 if doData:
     accData = [None] * nSimPoints
-    
+# And for the GIN:
+if doTrainableGNN:
+    accGIN = [None] * nSimPoints
+
 #%%##################################################################
 #                                                                   #
 #                    DATASET HANDLING                               #
@@ -266,7 +386,7 @@ if doPrint:
     print("OK")
 # Now, to create the proper graph object, since we're going to use
 # 'fuseEdges' option in createGraph, we are going to add an extra dimension
-# to the adjacencyMatrix (to indicate there's only one matrix in the 
+# to the adjacencyMatrix (to indicate there's only one matrix in the
 # collection that we should be fusing)
 adjacencyMatrix = adjacencyMatrix.reshape([1, N, N])
 nodeList = []
@@ -306,7 +426,7 @@ if doPrint:
 # We have now created the graph and selected the source nodes on that graph.
 # So now we proceed to generate random data realizations, different
 # realizations of diffusion processes.
-    
+
 #%%##################################################################
 #                                                                   #
 #                    GRAPH SCATTERING MODELS                        #
@@ -322,6 +442,12 @@ modelsGST = {} # Store each model as a key in this dictionary, then we
 
 if doDiffusion:
     modelsGST[diffusionName] = GST.DiffusionScattering(numScales,numLayers,G.W)
+
+if doGeometric:
+    modelsGST[geometricName] = GST.GeometricScattering(numScales,
+                                                       numLayers,
+                                                       numMoments,
+                                                       G.W)
 
 if doMonicCubic:
     modelsGST[monicCubicName] = GST.MonicCubic(numScales,numLayers, G.W)
@@ -375,7 +501,7 @@ if doGFT:
 # For each value of nTrain (number of selected training samples)
 
 for itN in range(nSimPoints):
-    
+
     thisProbEdgeFail = probEdgeFail[itN]
 
     if doPrint:
@@ -386,7 +512,7 @@ for itN in range(nSimPoints):
     # consider.
     # Now, for each probability, we have multiple edge failure realizations so
     # we want, for each probability of edge failure, to create a list to hold
-    # each of those values 
+    # each of those values
     for thisModel in modelList:
         accGST[thisModel][itN] = [None] * nEdgeFailRealizations
     # Repeat for the GFT error
@@ -395,37 +521,40 @@ for itN in range(nSimPoints):
     # And if we use data straightaway
     if doData:
         accData[itN] = [None] * nEdgeFailRealizations
-        
+    # And if we use a trainable GNN (GIN)
+    if doTrainableGNN:
+        accGIN[itN] = [None] * nEdgeFailRealizations
+
     #%%##################################################################
     #                                                                   #
     #                    EDGE FAILURE REALIZATIONS                      #
     #                                                                   #
     #####################################################################
-    
+
     # Start generating a new edge failure realizations for each probability
     # of edge failure
-    
+
     for fail in range(nEdgeFailRealizations):
-        
+
         #########
         # GRAPH #
         #########
-        
+
         if doPrint:
             print("Simulating edge fail no. %d..." % (fail+1),
                   end = ' ', flush = True)
-        
+
         edgeFailAdjacency = graphTools.edgeFailSampling(G.W, thisProbEdgeFail)
         Ghat = graphTools.Graph('adjacency', G.N,
                                 {'adjacencyMatrix': edgeFailAdjacency})
-        
+
         if doPrint:
             print("OK")
-        
+
         ############
         # DATASETS #
         ############
-        
+
         if doPrint:
             print("Creating dataset...", end = ' ', flush = True)
 
@@ -433,160 +562,231 @@ for itN in range(nSimPoints):
         #   can go ahead and generate the datasets.
         data = Utils.dataTools.SourceLocalization(Ghat, nTrain, nValid, nTest,
                                                   sourceNodes, tMax = tMax)
-        
+
         if doPrint:
             print("OK")
-            
+
         #%%##################################################################
         #                                                                   #
         #                    CLASSIFIER: Linear SVM                         #
         #                                                                   #
         #####################################################################
-        
+
         classifiers = {}
-        
+
         ############
         # GET DATA #
         ############
-        
+
         xTrain, yTrain = data.getSamples('train')
         xTrain = xTrain.reshape(data.nTrain, 1, G.N)
         xValid, yValid = data.getSamples('valid')
         xValid = xValid.reshape(data.nValid, 1, G.N)
         xTest, yTest = data.getSamples('test')
         xTest = xTest.reshape(data.nTest, 1, G.N)
-        
+
          ##################################
         #                                  #
         #    GRAPH SCATTERING TRANSFORM    #
         #                                  #
          ##################################
-        
+
         for thisModel in modelList:
-            
+
             ################
             # ARCHITECTURE #
             ################
-            
+
             classifiers[thisModel] = LinearSVC()
-            
+
             ############
             # TRAINING #
             ############
-            
+
             xTrainGST = modelsGST[thisModel].computeTransform(xTrain)
             xTrainGST = xTrainGST.squeeze(1) # nTrain x nFeatures
             classifiers[thisModel].fit(xTrainGST, yTrain)
-            
+
             ##############
             # VALIDATION #
             ##############
-            
+
             xValidGST = modelsGST[thisModel].computeTransform(xValid)
             xValidGST = xValidGST.squeeze(1) # nValid x nFeatures
             yHatValid = classifiers[thisModel].predict(xValidGST)
             # Compute accuracy:
             accValid = np.sum(yValid == yHatValid)/data.nValid
-            
+
             if doPrint:
                 print("\t%15s: %.4f" % (thisModel, accValid))
-            
+
             ##############
             # EVALUATION #
             ##############
-            
+
             xTestGST = modelsGST[thisModel].computeTransform(xTest)
             xTestGST = xTestGST.squeeze(1) # nValid x nFeatures
             yHatTest = classifiers[thisModel].predict(xTestGST)
             # Compute accuracy:
             accTest = np.sum(yTest == yHatTest)/data.nTest
             accGST[thisModel][itN][fail] = accTest
-            
+
          ###############################
         #                               #
         #    GRAPH FOURIER TRANSFORM    #
         #                               #
          ###############################
-            
+
         if doGFT:
-            
+
             ################
             # ARCHITECTURE #
             ################
-            
+
             classifierGFT = LinearSVC()
-            
+
             ############
             # TRAINING #
             ############
-            
+
             xTrainGFT = (xTrain @ GFT).squeeze(1) # nTrain x nFeatures
             classifierGFT.fit(xTrainGFT, yTrain)
-            
+
             ##############
             # VALIDATION #
             ##############
-            
+
             xValidGFT = (xValid @ GFT).squeeze(1) # nValid x nFeatures
             yHatValid = classifierGFT.predict(xValidGFT)
             # Compute accuracy:
             accValid = np.sum(yValid == yHatValid)/data.nValid
-            
+
             if doPrint:
                 print("\t%15s: %.4f" % (GFTname, accValid))
-            
+
             ##############
             # EVALUATION #
             ##############
-            
+
             xTestGFT = (xTest @ GFT).squeeze(1) # nValid x nFeatures
             yHatTest = classifierGFT.predict(xTestGFT)
             # Compute accuracy:
             accTest = np.sum(yTest == yHatTest)/data.nTest
             accGFT[itN][fail] = accTest
-            
+
         ######################
         #                     #
         #    STRAIGHT DATA    #
         #                     #
          #####################
-            
+
         if doData:
-            
+
             ################
             # ARCHITECTURE #
             ################
-            
+
             classifierData = LinearSVC()
-            
+
             ############
             # TRAINING #
             ############
-            
+
             xTrainData = xTrain.squeeze(1) # nTrain x nFeatures
             classifierData.fit(xTrainData, yTrain)
-            
+
             ##############
             # VALIDATION #
             ##############
-            
+
             xValidData = xValid.squeeze(1) # nValid x nFeatures
             yHatValid = classifierData.predict(xValidData)
             # Compute accuracy:
             accValid = np.sum(yValid == yHatValid)/data.nValid
-            
+
             if doPrint:
                 print("\t%15s: %.4f" % (DataName, accValid))
-            
+
             ##############
             # EVALUATION #
             ##############
-            
+
             xTestData = xTest.squeeze(1) # nValid x nFeatures
             yHatTest = classifierData.predict(xTestData)
             # Compute accuracy:
             accTest = np.sum(yTest == yHatTest)/data.nTest
             accData[itN][fail] = accTest
+
+         ###############################
+        #                               #
+        #    GRAPH NEURAL NETWORKS      #
+        #                               #
+         ###############################
+
+        if doTrainableGNN:
+
+            # Add the number of nodes (given that there is no pooling, the
+            # number of nodes remains the same)
+            hParamsGIN['N'] = [Ghat.N]
+            # Make data the correct type
+            data.astype(torch.float64)
+            data.expandDims()
+            # Adapt GSO
+            Ghat.computeGFT()
+            S = Ghat.W/np.max(np.real(Ghat.E))
+            S, order = graphTools.permIdentity(S)
+            #S = torch.tensor(S).to(device)
+
+            ################
+            # ARCHITECTURE #
+            ################
+
+            #\\\\\\\
+            #\\\ MODEL: GIN
+            #\\\\\\\\\\\\
+
+            GIN = archit.SelectionGNN(hParamsGIN['F'],
+                                      hParamsGIN['K'],
+                                      hParamsGIN['bias'],
+                                      hParamsGIN['sigma'],
+                                      hParamsGIN['N'],
+                                      hParamsGIN['rho'],
+                                      hParamsGIN['alpha'],
+                                      hParamsGIN['dimLayersMLP'],
+                                      S)
+            GIN.to(device) # Move architecture to the selected device
+            # Optimizer
+            optimizer = optim.Adam(GIN.parameters(),
+                                   lr = learningRate, betas = (beta1, beta2))
+            # Loss function
+            chosenLoss = lossFunction()
+            # Model
+            modelBind = model.Model(GIN, chosenLoss, optimizer,
+                                    hParamsGIN['name'], saveDir, order)
+
+            ############
+            # TRAINING # (and VALIDATION)
+            ############
+
+            if doPrint:
+                print("\t%15s: Training..." % GINname, end = ' ', flush = True)
+
+            modelBind.train(data, nEpochs, batchSize, **trainingOptions)
+
+            if doPrint:
+                print("OK", flush = True)
+
+            ##############
+            # EVALUATION #
+            ##############
+
+            accTest, _ = modelBind.evaluate(data)
+
+            # Save accuracy:
+            accGIN[itN][fail] = accTest.item()
+
+        del xTrain, yTrain, xValid, yValid, xTest, yTest
+        del Ghat, S
 
 
 #%%##################################################################
@@ -635,6 +835,16 @@ if doData:
     meanAccData = np.mean(accData, axis = 1)
     stdDevAccData = np.std(accData, axis = 1)
 
+# Compute for GNN
+if doTrainableGNN:
+    # Convert the lists into a matrix (2 dimensions):
+    #  len(ratioTrain) x nDataSplits
+    accGIN = np.array(accGIN)
+
+    # Compute mean and standard deviation across data splits
+    meanAccGIN = np.mean(accGIN, axis = 1)
+    stdDevAccGIN = np.std(accGIN, axis = 1)
+
 ################
 # SAVE RESULTS #
 ################
@@ -655,6 +865,23 @@ if doSaveVars:
     # Save all these results that we use to reconstruct the values
     #   Save these variables
     varsDict = {}
+    # Values needed for reproducing the figures
+    varsDict['probEdgeFail'] = probEdgeFail
+    if doDiffusion:
+        varsDict['diffusionName'] = diffusionName
+    if doGeometric:
+        varsDict['geometricName'] = geometricName
+    if doMonicCubic:
+        varsDict['monicCubicName'] = monicCubicName
+    if doTightHann:
+        varsDict['tightHannName'] = tightHannName
+    if doGFT:
+        varsDict['GFTname'] = GFTname
+    if doData:
+        varsDict['DataName'] = DataName
+    if doTrainableGNN:
+        varsDict['GINname'] = GINname
+    # Actual results
     varsDict['accGST'] = accGST
     varsDict['meanAccGST'] = meanAccGST
     varsDict['stdDevAccGST'] = stdDevAccGST
@@ -666,6 +893,10 @@ if doSaveVars:
         varsDict['accData'] = accData
         varsDict['meanAccData'] = meanAccData
         varsDict['stdDevAccData'] = stdDevAccData
+    if doTrainableGNN:
+        varsDict['accGIN'] = accGIN
+        varsDict['meanAccGIN'] = meanAccGIN
+        varsDict['stdDevAccGIN'] = stdDevAccGIN
     #   Determine filename to save them into
     varsFilename = 'classificationAccuracy.pkl'
     pathToFile = os.path.join(saveDirResults, varsFilename)
@@ -695,6 +926,10 @@ if doFigs:
         plt.errorbar(probEdgeFail, meanAccData, yerr = stdDevAccData,
                      linewidth = lineWidth,
                      marker = markerShape, markerSize = markerSize)
+    if doTrainableGNN:
+        plt.errorbar(probEdgeFail, meanAccGIN, yerr = stdDevAccGIN,
+                     linewidth = lineWidth,
+                     marker = markerShape, markerSize = markerSize)
     plt.xscale('log')
     plt.ylabel(r'Classification accuracy')
     plt.xlabel(r'Probability of edge failure')
@@ -703,6 +938,8 @@ if doFigs:
         modelList.append(GFTname)
     if doData:
         modelList.append(DataName)
+    if doTrainableGNN:
+        modelList.append(GINname)
     plt.legend(modelList)
     accFig.savefig(os.path.join(saveDirResults, 'classifAccFig.pdf'),
                          bbox_inches = 'tight')

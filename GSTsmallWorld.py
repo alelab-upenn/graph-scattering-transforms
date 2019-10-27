@@ -1,4 +1,4 @@
-# 2019/05/20~23
+# 2019/10/27
 # Fernando Gama, fgama@seas.upenn.edu
 
 # Graph scattering transform.
@@ -6,7 +6,7 @@
 # Compute the representation difference on a small world graph.
 # Representations considered:
 #   GFT: unstable graph-dependent representation
-#   Diffusion scattering: comparison with other works
+#   Geometric scattering: Gao et al scattering
 #   Monic cubic polynomial wavelet: Hammond et al wavelets
 #   Tight Hann wavelets: Shuman et al wavelets
 # Theoretical bound obtained also shown in the graphs.
@@ -122,9 +122,12 @@ writeVarValues(varsFile, {'nTest': nTest,
 #################
 
 # Select which wavelets to use
-doDiffusion = True # F. Gama, A. Ribeiro, and J. Bruna, "Diffusion scattering
-    # transforms on graphs,” in Int. Conf. Learning Representations 2019.
-    # New Orleans, LA: Assoc. Comput. Linguistics, 6-9 May 2019.
+doDiffusion = False # F. Gama, A. Ribeiro, and J. Bruna, "Diffusion scattering
+    # transforms on graphs," in 7th Int. Conf. Learning Representations. New
+    # Orleans, LA: Assoc. Comput. Linguistics, 6-9 May 2019, pp. 1–12.
+doGeometric = True # F. Gao, G. Wolf, and M. Hirn, "Geometric scattering for
+    # graph data analysis," in 36th Int. Conf. Mach. Learning, Long Beach, CA,
+    # 15-9 June 2019, pp. 1–10.
 doMonicCubic = True # Eq. (65) in D. K. Hammond, P. Vandergheynst, and
     # R. Gribonval, "Wavelets on graphs via spectral graph theory," Appl.
     # Comput. Harmonic Anal., vol. 30, no. 2, pp. 129–150, March 2011.
@@ -148,9 +151,13 @@ numScales = 6 # Number of scales J (the first element might be the "low-pass"
     # wavelet) so we would get J-1 "wavelet scales" and 1 (the first one, j=0)
     # "low-pass" wavelet
 numLayers = 3 # Number of layers L (0, ..., L-1) with l=0 being just Ux
+numMoments = 4 # For the geometric scattering transform, this is the number of
+    # moments to compute in the summarizing operation U
 
 #\\\ Save values:
-writeVarValues(varsFile, {'numScales': numScales, 'numLayers': numLayers})
+writeVarValues(varsFile, {'numScales': numScales,
+                          'numLayers': numLayers,
+                          'numMoments': numMoments})
 
 modelList = [] # List to store the list of models chosen
 
@@ -158,6 +165,9 @@ modelList = [] # List to store the list of models chosen
 if doDiffusion:
     diffusionName = 'Diffusion'
     modelList.append(diffusionName)
+if doGeometric:
+    geometricName = 'Geometric'
+    modelList.append(geometricName)
 if doMonicCubic:
     monicCubicName = 'Monic Cubic'
     modelList.append(monicCubicName)
@@ -266,8 +276,15 @@ for graph in range(nGraphRealizations):
         # the key), since all models have a computeTransform() method.
 
     if doDiffusion:
-        modelsGST[diffusionName] = \
-                              GST.DiffusionScattering(numScales, numLayers, G.W)
+        modelsGST[diffusionName] = GST.DiffusionScattering(numScales,
+                                                           numLayers,
+                                                           G.W)
+
+    if doGeometric:
+        modelsGST[geometricName] = GST.GeometricScattering(numScales,
+                                                           numLayers,
+                                                           numMoments,
+                                                           G.W)
 
     if doMonicCubic:
         modelsGST[monicCubicName] = GST.MonicCubic(numScales, numLayers, G.W)
@@ -388,6 +405,11 @@ for graph in range(nGraphRealizations):
             if doDiffusion:
                 perturbedModelsGST[diffusionName] = \
                              GST.DiffusionScattering(numScales, numLayers, What)
+
+            if doGeometric:
+                perturbedModelsGST[geometricName] = \
+                                   GST.GeometricScattering(numScales, numLayers,
+                                                           numMoments, What)
 
             if doMonicCubic:
                 perturbedModelsGST[monicCubicName] = \
@@ -560,12 +582,25 @@ if doSaveVars:
     # Save all these results that we use to reconstruct the values
     #   Save these variables
     varsDict = {}
+    if doDiffusion:
+        varsDict['diffusionName'] = diffusionName
+    if doGeometric:
+        varsDict['geometricName'] = geometricName
+    if doMonicCubic:
+        varsDict['monicCubicName'] = monicCubicName
+    if doTightHann:
+        varsDict['tightHannName'] = tightHannName
+    if doGFT:
+        varsDict['GFTname'] = GFTname
+    if computeBound:
+        varsDict['boundName'] = boundName
+    varsDict['perturbationEpsilon'] = perturbationEpsilon
     varsDict['reprError'] = reprError
     varsDict['meanReprErrorPerGraph'] = meanReprErrorPerGraph
     varsDict['meanReprError'] = meanReprError
     varsDict['stdDevReprError'] = stdDevReprError
     if doGFT:
-        varsDict['reprErrorGFT'] = reprError
+        varsDict['reprErrorGFT'] = reprErrorGFT
         varsDict['meanReprErrorPerGraphGFT'] = meanReprErrorPerGraphGFT
         varsDict['meanReprErrorGFT'] = meanReprErrorGFT
         varsDict['stdDevReprErrorGFT'] = stdDevReprErrorGFT
